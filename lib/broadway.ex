@@ -1097,6 +1097,17 @@ defmodule Broadway do
           end
         end)
 
+        Enum.each(opts[:processors], fn {processor_name, processor_opts} ->
+          max = Keyword.get(processor_opts, :max_processor_concurrency)
+          concurrency = Keyword.get(processor_opts, :concurrency, System.schedulers_online() * 2)
+
+          if max != nil and max < concurrency do
+            raise ArgumentError,
+                  ":max_processor_concurrency (#{max}) must be >= :concurrency (#{concurrency}) " <>
+                    "for processor #{inspect(processor_name)}"
+          end
+        end)
+
         opts =
           opts
           |> carry_over_one(:producer, [:hibernate_after, :spawn_opt])
@@ -1233,17 +1244,29 @@ defmodule Broadway do
       dynamically using `Supervisor.start_child/2` and `Supervisor.terminate_child/2`.
       This is the most efficient approach as it doesn't disrupt other processors.
 
-    * **PartitionDispatcher** (with `partition_by`): Currently not supported because
-      the producer's dispatcher partition count is fixed at init time. New processors
-      cannot subscribe to partitions that don't exist.
-      Returns `{:error, :partition_dispatcher_requires_pipeline_restart}`.
+    * **PartitionDispatcher** (with `partition_by`): Scaling is limited by the
+      `:max_processor_concurrency` option. By default, this equals `:concurrency`,
+      meaning scaling is not possible without a pipeline restart. To enable scaling,
+      configure `:max_processor_concurrency` to pre-allocate partitions:
+
+          processors: [
+            default: [
+              concurrency: 2,
+              max_processor_concurrency: 8,
+              partition_by: fn msg -> msg.user_id end
+            ]
+          ]
+
+      This pre-allocates 8 partitions in the producer's dispatcher, allowing scaling
+      from 2 to 8 processors at runtime. Attempting to scale beyond this limit returns
+      `{:error, {:exceeds_max_processor_concurrency, max}}`.
 
   ## Returns
 
     * `:ok` on success
     * `{:error, :no_change_required}` if already at target count
     * `{:error, :processor_not_found}` if processor_key doesn't exist
-    * `{:error, :partition_dispatcher_requires_pipeline_restart}` for pipelines with `partition_by`
+    * `{:error, {:exceeds_max_processor_concurrency, max}}` when scaling beyond the configured limit
     * `{:error, {:failed_to_add_processor, index, reason}}` if scaling up fails
     * `{:error, {:failed_to_remove_processor, index, reason}}` if scaling down fails
 

@@ -299,8 +299,9 @@ defmodule Broadway.Topology do
 
         func ->
           n_processors = processor_config[:concurrency]
-          hash_func = fn msg -> {msg, rem(func.(msg), n_processors)} end
-          {GenStage.PartitionDispatcher, partitions: 0..(n_processors - 1), hash: hash_func}
+          max_processors = Keyword.get(processor_config, :max_processor_concurrency, n_processors)
+          hash_func = fn msg -> {msg, rem(func.(msg), max_processors)} end
+          {GenStage.PartitionDispatcher, partitions: 0..(max_processors - 1), hash: hash_func}
       end
 
     args = [broadway: opts, dispatcher: dispatcher, rate_limiter: rate_limiter] ++ producer_config
@@ -858,20 +859,29 @@ defmodule Broadway.Topology do
   # Proper PartitionDispatcher scaling would require also restarting producers
   # to reconfigure their dispatchers, which defeats the purpose of hot scaling.
   #
-  # Future options:
-  # 1. Restart entire pipeline (defeats hot scaling goal)
-  # 2. Use a different subscription mechanism that doesn't depend on partition count
-  # 3. Pre-configure dispatcher with max expected partitions
-  defp scale_with_supervisor_restart(state, processor_key, new_count, _opts) do
-    current_count = get_processor_count_value(state.config, processor_key)
-    emit_scale_telemetry(:start, state, processor_key, current_count, new_count)
+  # With max_processor_concurrency, we pre-allocate partitions at startup,
+  # allowing scaling up to that limit without producer restart.
+  defp scale_with_supervisor_restart(state, processor_key, new_count, opts) do
+    config = state.config
+    processor_config = Keyword.fetch!(config.processors_config, processor_key)
+    current_count = processor_config[:concurrency]
+    max_count = Keyword.get(processor_config, :max_processor_concurrency, current_count)
 
-    # For PartitionDispatcher, we cannot scale without restarting producers
-    # because the dispatcher's partition count is fixed at init time.
-    result = {:error, :partition_dispatcher_requires_pipeline_restart}
+    cond do
+      new_count > max_count ->
+        # Cannot scale beyond pre-allocated partitions
+        emit_scale_telemetry(:start, state, processor_key, current_count, new_count)
+        result = {:error, {:exceeds_max_processor_concurrency, max_count}}
+        emit_scale_telemetry(:stop, state, processor_key, current_count, new_count, result)
+        {result, state}
 
-    emit_scale_telemetry(:stop, state, processor_key, current_count, new_count, result)
-    {result, state}
+      new_count == current_count ->
+        {{:error, :no_change_required}, state}
+
+      true ->
+        # Use dynamic children strategy since partitions are pre-allocated
+        scale_with_dynamic_children(state, processor_key, new_count, current_count, opts)
+    end
   end
 
   defp update_processor_concurrency_in_config(state, processor_key, new_count) do

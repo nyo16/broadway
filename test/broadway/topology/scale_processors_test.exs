@@ -262,13 +262,13 @@ defmodule Broadway.Topology.ScaleProcessorsTest do
     end
   end
 
-  describe "scale_processors/4 with PartitionDispatcher (with partition_by)" do
-    test "returns error for partition_by pipelines - requires pipeline restart" do
+  describe "scale_processors/4 with PartitionDispatcher (with partition_by, no max)" do
+    test "returns error when scaling beyond default max_processor_concurrency" do
       broadway = start_broadway_with_partition_by(ForwarderWithPartitionBy, concurrency: 2)
 
-      # PartitionDispatcher scaling requires restarting producers because
-      # the dispatcher's partition count is fixed at init time
-      assert {:error, :partition_dispatcher_requires_pipeline_restart} =
+      # Without max_processor_concurrency, defaults to concurrency (2)
+      # Cannot scale beyond that limit
+      assert {:error, {:exceeds_max_processor_concurrency, 2}} =
                Broadway.Topology.scale_processors(broadway, :default, 4)
 
       # Count should remain unchanged
@@ -286,6 +286,119 @@ defmodule Broadway.Topology.ScaleProcessorsTest do
       push_messages(producer, 1..4)
       assert_receive {:batch_handled, :default, _}, 5000
       assert_receive {:batch_handled, :default, _}, 5000
+    end
+  end
+
+  describe "scale_processors/4 with PartitionDispatcher and max_processor_concurrency" do
+    test "raises if max_processor_concurrency < concurrency" do
+      assert_raise ArgumentError,
+                   ~r/:max_processor_concurrency \(2\) must be >= :concurrency \(4\)/,
+                   fn ->
+                     Broadway.start_link(ForwarderWithPartitionBy,
+                       name: new_unique_name(),
+                       producer: [module: {ManualProducer, %{test_pid: self()}}],
+                       processors: [
+                         default: [
+                           concurrency: 4,
+                           max_processor_concurrency: 2,
+                           partition_by: fn msg -> msg.data end
+                         ]
+                       ],
+                       batchers: [default: [batch_size: 2]],
+                       context: %{test_pid: self()}
+                     )
+                   end
+    end
+
+    test "scales up when max_processor_concurrency allows" do
+      broadway =
+        start_broadway_with_partition_by_and_max(ForwarderWithPartitionBy,
+          concurrency: 2,
+          max_processor_concurrency: 8
+        )
+
+      assert :ok = Broadway.Topology.scale_processors(broadway, :default, 4)
+      assert get_processor_count(broadway) == 4
+      assert count_processor_children(broadway) == 4
+    end
+
+    test "scales down within max_processor_concurrency" do
+      broadway =
+        start_broadway_with_partition_by_and_max(ForwarderWithPartitionBy,
+          concurrency: 4,
+          max_processor_concurrency: 8
+        )
+
+      assert :ok = Broadway.Topology.scale_processors(broadway, :default, 2, drain_timeout: 100)
+      assert get_processor_count(broadway) == 2
+      assert count_processor_children(broadway) == 2
+    end
+
+    test "returns error when scaling beyond max_processor_concurrency" do
+      broadway =
+        start_broadway_with_partition_by_and_max(ForwarderWithPartitionBy,
+          concurrency: 2,
+          max_processor_concurrency: 4
+        )
+
+      assert {:error, {:exceeds_max_processor_concurrency, 4}} =
+               Broadway.Topology.scale_processors(broadway, :default, 6)
+
+      # Count should remain unchanged
+      assert get_processor_count(broadway) == 2
+    end
+
+    test "messages flow correctly after scaling with partition_by" do
+      broadway =
+        start_broadway_with_partition_by_and_max(ForwarderWithPartitionBy,
+          concurrency: 2,
+          max_processor_concurrency: 8
+        )
+
+      # Push initial messages - use values that map to active partitions (0, 1)
+      # With max_processors=8, rem(0,8)=0, rem(1,8)=1, rem(8,8)=0, rem(9,8)=1
+      producer = get_producer_pid(broadway)
+      push_messages(producer, [0, 1, 8, 9])
+      assert_receive {:batch_handled, :default, _}, 5000
+      assert_receive {:batch_handled, :default, _}, 5000
+
+      # Scale up to 4 processors
+      :ok = Broadway.Topology.scale_processors(broadway, :default, 4)
+      Process.sleep(100)
+
+      # Now partitions 0, 1, 2, 3 are active
+      # rem(2,8)=2, rem(3,8)=3, rem(10,8)=2, rem(11,8)=3
+      push_messages(producer, [2, 3, 10, 11])
+      assert_receive {:batch_handled, :default, _}, 5000
+      assert_receive {:batch_handled, :default, _}, 5000
+    end
+
+    test "multiple scale operations within max" do
+      broadway =
+        start_broadway_with_partition_by_and_max(ForwarderWithPartitionBy,
+          concurrency: 2,
+          max_processor_concurrency: 8
+        )
+
+      # Scale up
+      :ok = Broadway.Topology.scale_processors(broadway, :default, 4)
+      assert get_processor_count(broadway) == 4
+
+      # Scale up more
+      :ok = Broadway.Topology.scale_processors(broadway, :default, 6)
+      assert get_processor_count(broadway) == 6
+
+      # Scale down
+      :ok = Broadway.Topology.scale_processors(broadway, :default, 3, drain_timeout: 100)
+      assert get_processor_count(broadway) == 3
+
+      # Scale back up to max
+      :ok = Broadway.Topology.scale_processors(broadway, :default, 8)
+      assert get_processor_count(broadway) == 8
+
+      # Cannot exceed max
+      assert {:error, {:exceeds_max_processor_concurrency, 8}} =
+               Broadway.Topology.scale_processors(broadway, :default, 10)
     end
   end
 
@@ -429,6 +542,31 @@ defmodule Broadway.Topology.ScaleProcessorsTest do
         processors: [
           default: [
             concurrency: concurrency,
+            partition_by: fn msg -> msg.data end
+          ]
+        ],
+        batchers: [default: [batch_size: 2, batch_timeout: 100]],
+        context: %{test_pid: self()}
+      )
+
+    assert_receive {:producer_initialized, _pid}
+
+    broadway
+  end
+
+  defp start_broadway_with_partition_by_and_max(module, opts) do
+    broadway = new_unique_name()
+    concurrency = Keyword.get(opts, :concurrency, 2)
+    max_concurrency = Keyword.get(opts, :max_processor_concurrency, concurrency)
+
+    {:ok, _pid} =
+      Broadway.start_link(module,
+        name: broadway,
+        producer: [module: {ManualProducer, %{test_pid: self()}}],
+        processors: [
+          default: [
+            concurrency: concurrency,
+            max_processor_concurrency: max_concurrency,
             partition_by: fn msg -> msg.data end
           ]
         ],

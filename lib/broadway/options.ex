@@ -195,6 +195,19 @@ defmodule Broadway.Options do
               doc: """
               Overrides the top-level `:hibernate_after`.
               """
+            ],
+            max_processor_concurrency: [
+              type: :pos_integer,
+              doc: """
+              The maximum number of processors that can be scaled to at runtime
+              when using `partition_by`. The producer's dispatcher will be configured
+              with this many partitions, allowing dynamic scaling up to this limit.
+              Defaults to `concurrency`.
+
+              This option only affects pipelines with `partition_by` configured.
+              Without `partition_by`, processors can be scaled dynamically without
+              this limit using `Broadway.scale_processors/4`.
+              """
             ]
           ]
         ]
