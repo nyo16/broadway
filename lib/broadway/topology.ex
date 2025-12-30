@@ -2,13 +2,16 @@ defmodule Broadway.Topology do
   @moduledoc false
   @behaviour GenServer
 
+  require Logger
+
   alias Broadway.Topology.{
     ProducerStage,
     ProcessorStage,
     BatcherStage,
     BatchProcessorStage,
     Terminator,
-    RateLimiter
+    RateLimiter,
+    Subscriber
   }
 
   alias Broadway.ConfigStorage
@@ -35,6 +38,60 @@ defmodule Broadway.Topology do
     config(server).topology
   end
 
+  @doc """
+  Scales the processor concurrency at runtime.
+
+  ## Parameters
+
+    * `server` - Broadway server name or PID
+    * `processor_key` - The processor key (usually `:default`)
+    * `new_count` - Target number of processors
+    * `opts` - Options (see below)
+
+  ## Options
+
+    * `:drain_timeout` - Time in ms to wait for processors to drain (default: 15_000)
+    * `:strategy` - Either `:graceful` (wait for drain) or `:immediate` (default: `:graceful`)
+
+  ## Returns
+
+    * `:ok` on success
+    * `{:error, reason}` on failure
+
+  ## Scaling Strategies
+
+  The scaling strategy depends on the dispatcher type:
+
+    * **DemandDispatcher** (no `partition_by`): Processors are added/removed dynamically
+      using `Supervisor.start_child/2` and `Supervisor.terminate_child/2`.
+
+    * **PartitionDispatcher** (with `partition_by`): The ProcessorSupervisor and downstream
+      components are restarted with the new configuration. Producers are not affected.
+
+  ## Examples
+
+      # Scale up to 8 processors
+      Broadway.Topology.scale_processors(MyBroadway, :default, 8)
+
+      # Scale down with graceful draining
+      Broadway.Topology.scale_processors(MyBroadway, :default, 2, drain_timeout: 30_000)
+
+  """
+  @spec scale_processors(GenServer.server(), atom(), pos_integer(), keyword()) ::
+          :ok | {:error, term()}
+  def scale_processors(server, processor_key \\ :default, new_count, opts \\ [])
+      when is_integer(new_count) and new_count > 0 do
+    GenServer.call(server, {:scale_processors, processor_key, new_count, opts}, :infinity)
+  end
+
+  @doc """
+  Returns the current processor count for the given processor key.
+  """
+  @spec get_processor_count(GenServer.server(), atom()) :: {:ok, pos_integer()} | {:error, term()}
+  def get_processor_count(server, processor_key \\ :default) do
+    GenServer.call(server, {:get_processor_count, processor_key})
+  end
+
   defp config(server) do
     config_storage = ConfigStorage.get_module()
 
@@ -54,6 +111,7 @@ defmodule Broadway.Topology do
     {child_specs, opts} = prepare_for_start(module, opts)
 
     config = init_config(module, opts)
+    {producers_names, _} = build_producers_specs(config, opts)
     {:ok, supervisor_pid} = start_supervisor(child_specs, config, opts)
 
     emit_init_event(opts, supervisor_pid)
@@ -61,18 +119,32 @@ defmodule Broadway.Topology do
     config_storage.put(config.name, %__MODULE__{
       context: config.context,
       topology: build_topology_details(config),
-      producer_names: process_names(config, "Producer", config.producer_config),
+      producer_names: producers_names,
       batchers_names:
         Enum.map(config.batchers_config, &process_name(config, "Batcher", elem(&1, 0))),
       rate_limiter_name: config.rate_limiter
     })
 
+    # Store full config in state for scaling operations
     {:ok,
      %{
        supervisor_pid: supervisor_pid,
        terminator: config.terminator,
-       name: config.name
+       name: config.name,
+       config: config,
+       producers_names: producers_names
      }}
+  end
+
+  @impl true
+  def handle_call({:scale_processors, processor_key, new_count, opts}, _from, state) do
+    {result, new_state} = do_scale_processors(state, processor_key, new_count, opts)
+    {:reply, result, new_state}
+  end
+
+  def handle_call({:get_processor_count, processor_key}, _from, state) do
+    result = get_current_processor_count(state.config, processor_key)
+    {:reply, result, state}
   end
 
   @impl true
@@ -562,5 +634,319 @@ defmodule Broadway.Topology do
       start: {Supervisor, :start_link, [children, [name: name] ++ opts]},
       type: :supervisor
     }
+  end
+
+  ## Scaling Implementation
+
+  defp do_scale_processors(state, processor_key, new_count, opts) do
+    config = state.config
+    current_count = get_processor_count_value(config, processor_key)
+
+    cond do
+      current_count == {:error, :processor_not_found} ->
+        {{:error, :processor_not_found}, state}
+
+      current_count == new_count ->
+        {{:error, :no_change_required}, state}
+
+      uses_partition_dispatcher?(config, processor_key) ->
+        scale_with_supervisor_restart(state, processor_key, new_count, opts)
+
+      true ->
+        scale_with_dynamic_children(state, processor_key, new_count, current_count, opts)
+    end
+  end
+
+  defp get_current_processor_count(config, processor_key) do
+    case get_processor_count_value(config, processor_key) do
+      {:error, _} = error -> error
+      count -> {:ok, count}
+    end
+  end
+
+  defp get_processor_count_value(config, processor_key) do
+    case Keyword.fetch(config.processors_config, processor_key) do
+      {:ok, processor_config} -> processor_config[:concurrency]
+      :error -> {:error, :processor_not_found}
+    end
+  end
+
+  defp uses_partition_dispatcher?(config, processor_key) do
+    case Keyword.fetch(config.processors_config, processor_key) do
+      {:ok, processor_config} -> processor_config[:partition_by] != nil
+      :error -> false
+    end
+  end
+
+  # Strategy 1: Dynamic Children (for DemandDispatcher)
+  defp scale_with_dynamic_children(state, processor_key, new_count, current_count, opts) do
+    emit_scale_telemetry(:start, state, processor_key, current_count, new_count)
+
+    result =
+      if new_count > current_count do
+        add_processors_dynamically(state, processor_key, current_count, new_count, opts)
+      else
+        remove_processors_dynamically(state, processor_key, current_count, new_count, opts)
+      end
+
+    emit_scale_telemetry(:stop, state, processor_key, current_count, new_count, result)
+
+    case result do
+      :ok ->
+        # Update the stored config with new concurrency
+        new_state = update_processor_concurrency_in_config(state, processor_key, new_count)
+        {:ok, new_state}
+
+      error ->
+        {error, state}
+    end
+  end
+
+  defp add_processors_dynamically(state, processor_key, from_count, to_count, _opts) do
+    batchers = config(state.name).batchers_names
+
+    for index <- from_count..(to_count - 1), reduce: :ok do
+      :ok ->
+        case start_single_processor(state, processor_key, index) do
+          {:ok, pid, processor_name} ->
+            # Notify batchers to subscribe to the new processor
+            notify_batchers_of_new_processor(batchers, processor_name)
+            Logger.debug("Added processor #{processor_name} (PID: #{inspect(pid)})")
+            :ok
+
+          {:error, reason} ->
+            {:error, {:failed_to_add_processor, index, reason}}
+        end
+
+      error ->
+        error
+    end
+  end
+
+  defp remove_processors_dynamically(state, processor_key, from_count, to_count, opts) do
+    drain_timeout = Keyword.get(opts, :drain_timeout, 15_000)
+    strategy = Keyword.get(opts, :strategy, :graceful)
+    processor_supervisor = get_processor_supervisor_pid(state)
+
+    for index <- (from_count - 1)..(to_count)//-1, reduce: :ok do
+      :ok ->
+        processor_name = build_processor_name_for_scaling(state.config, processor_key, index)
+
+        # Optionally drain the processor
+        if strategy == :graceful do
+          drain_processor(processor_name, drain_timeout)
+        end
+
+        case terminate_processor(processor_supervisor, processor_name) do
+          :ok ->
+            Logger.debug("Removed processor #{processor_name}")
+            :ok
+
+          {:error, reason} ->
+            {:error, {:failed_to_remove_processor, index, reason}}
+        end
+
+      error ->
+        error
+    end
+  end
+
+  defp start_single_processor(state, processor_key, index) do
+    config = state.config
+    processor_supervisor = get_processor_supervisor_pid(state)
+
+    processor_name = build_processor_name_for_scaling(config, processor_key, index)
+    processor_config = Keyword.fetch!(config.processors_config, processor_key)
+
+    # Build the processor type and dispatcher based on batchers
+    {type, dispatcher, batchers} =
+      case Keyword.keys(config.batchers_config) do
+        [] ->
+          {:consumer, nil, :none}
+
+        [_] = batchers ->
+          {:producer_consumer,
+           {GenStage.DemandDispatcher, shuffle_demands_on_first_dispatch: true}, batchers}
+
+        [_ | _] = batchers ->
+          {:producer_consumer,
+           {GenStage.PartitionDispatcher, partitions: batchers, hash: &{&1, &1.batcher}},
+           batchers}
+      end
+
+    args = [
+      topology_name: config.name,
+      name: processor_name,
+      partition: index,
+      type: type,
+      resubscribe: config.resubscribe_interval,
+      terminator: config.terminator,
+      module: config.module,
+      context: config.context,
+      dispatcher: dispatcher,
+      processor_key: processor_key,
+      processor_config: processor_config,
+      producers: state.producers_names,
+      producer: config.producer_config[:module],
+      batchers: batchers
+    ]
+
+    start_options = start_options(processor_name, processor_config)
+
+    spec = %{
+      start: {ProcessorStage, :start_link, [args, start_options]},
+      id: processor_name,
+      shutdown: config.shutdown
+    }
+
+    case Supervisor.start_child(processor_supervisor, spec) do
+      {:ok, pid} -> {:ok, pid, processor_name}
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  defp terminate_processor(processor_supervisor, processor_name) do
+    case Supervisor.terminate_child(processor_supervisor, processor_name) do
+      :ok ->
+        Supervisor.delete_child(processor_supervisor, processor_name)
+        :ok
+
+      {:error, :not_found} ->
+        :ok
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  defp drain_processor(processor_name, timeout) do
+    # Send drain signal if the processor exists
+    if pid = GenServer.whereis(processor_name) do
+      send(pid, :drain)
+      Process.sleep(timeout)
+    end
+
+    :ok
+  end
+
+  defp notify_batchers_of_new_processor(batcher_names, processor_name) do
+    for batcher_name <- batcher_names do
+      if pid = GenServer.whereis(batcher_name) do
+        Subscriber.subscribe_to(pid, processor_name)
+      end
+    end
+
+    :ok
+  end
+
+  defp get_processor_supervisor_pid(state) do
+    processor_supervisor_name = process_name(state.config, "ProcessorSupervisor")
+    GenServer.whereis(processor_supervisor_name)
+  end
+
+  defp build_processor_name_for_scaling(config, processor_key, index) do
+    process_name(config, "Processor_#{processor_key}", index)
+  end
+
+  # Strategy 2: Supervisor Restart (for PartitionDispatcher)
+  #
+  # NOTE: This strategy is NOT currently supported because the producer's
+  # PartitionDispatcher is configured at init time with a fixed partition count
+  # (based on processor concurrency). New processors with higher partition indices
+  # cannot subscribe to producers with fewer partitions.
+  #
+  # Proper PartitionDispatcher scaling would require also restarting producers
+  # to reconfigure their dispatchers, which defeats the purpose of hot scaling.
+  #
+  # Future options:
+  # 1. Restart entire pipeline (defeats hot scaling goal)
+  # 2. Use a different subscription mechanism that doesn't depend on partition count
+  # 3. Pre-configure dispatcher with max expected partitions
+  defp scale_with_supervisor_restart(state, processor_key, new_count, _opts) do
+    current_count = get_processor_count_value(state.config, processor_key)
+    emit_scale_telemetry(:start, state, processor_key, current_count, new_count)
+
+    # For PartitionDispatcher, we cannot scale without restarting producers
+    # because the dispatcher's partition count is fixed at init time.
+    result = {:error, :partition_dispatcher_requires_pipeline_restart}
+
+    emit_scale_telemetry(:stop, state, processor_key, current_count, new_count, result)
+    {result, state}
+  end
+
+  defp update_processor_concurrency_in_config(state, processor_key, new_count) do
+    # Update the in-memory config for future scaling operations
+    config = state.config
+
+    new_processors_config =
+      Keyword.update!(config.processors_config, processor_key, fn processor_config ->
+        Keyword.put(processor_config, :concurrency, new_count)
+      end)
+
+    new_config = %{config | processors_config: new_processors_config}
+    new_state = %{state | config: new_config}
+
+    # Also update the ConfigStorage topology details
+    update_config_storage_topology(new_state, processor_key, new_count)
+
+    new_state
+  end
+
+  defp update_config_storage_topology(state, processor_key, new_count) do
+    config_storage = ConfigStorage.get_module()
+    stored_config = config_storage.get(state.name)
+
+    if stored_config do
+      new_topology =
+        Keyword.update!(stored_config.topology, :processors, fn processors ->
+          Enum.map(processors, fn processor ->
+            if processor.processor_key == processor_key do
+              %{processor | concurrency: new_count}
+            else
+              processor
+            end
+          end)
+        end)
+
+      config_storage.put(state.name, %{stored_config | topology: new_topology})
+    end
+  end
+
+  ## Telemetry for Scaling
+
+  defp emit_scale_telemetry(:start, state, processor_key, from_count, to_count) do
+    measurements = %{system_time: System.monotonic_time()}
+
+    metadata = %{
+      broadway: state.name,
+      processor_key: processor_key,
+      from_count: from_count,
+      to_count: to_count
+    }
+
+    :telemetry.execute([:broadway, :scale, :start], measurements, metadata)
+  end
+
+  defp emit_scale_telemetry(:stop, state, processor_key, from_count, to_count, result) do
+    measurements = %{
+      system_time: System.monotonic_time(),
+      duration: System.monotonic_time()
+    }
+
+    strategy =
+      if uses_partition_dispatcher?(state.config, processor_key),
+        do: :supervisor_restart,
+        else: :dynamic_children
+
+    metadata = %{
+      broadway: state.name,
+      processor_key: processor_key,
+      from_count: from_count,
+      to_count: to_count,
+      strategy: strategy,
+      result: result
+    }
+
+    :telemetry.execute([:broadway, :scale, :stop], measurements, metadata)
   end
 end

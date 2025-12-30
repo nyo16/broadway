@@ -1203,6 +1203,117 @@ defmodule Broadway do
   end
 
   @doc """
+  Scales the processor concurrency at runtime.
+
+  This function allows you to dynamically change the number of processor
+  workers without restarting the entire pipeline.
+
+  ## Arguments
+
+    * `broadway` - The Broadway server name or PID
+    * `processor_key` - The processor key (defaults to `:default`)
+    * `new_count` - Target number of processor workers (must be positive)
+    * `opts` - Options (see below)
+
+  ## Options
+
+    * `:drain_timeout` - Time in milliseconds to wait for processors to drain
+      when scaling down. During this time, processors will complete their
+      current work before being terminated. Defaults to `15_000` (15 seconds).
+
+    * `:strategy` - How to handle scaling down:
+      * `:graceful` (default) - Wait for drain_timeout before terminating
+      * `:immediate` - Terminate processors immediately
+
+  ## Scaling Strategies
+
+  The scaling strategy depends on the dispatcher type configured for your pipeline:
+
+    * **DemandDispatcher** (no `partition_by`): Processors are added/removed
+      dynamically using `Supervisor.start_child/2` and `Supervisor.terminate_child/2`.
+      This is the most efficient approach as it doesn't disrupt other processors.
+
+    * **PartitionDispatcher** (with `partition_by`): Currently not supported because
+      the producer's dispatcher partition count is fixed at init time. New processors
+      cannot subscribe to partitions that don't exist.
+      Returns `{:error, :partition_dispatcher_requires_pipeline_restart}`.
+
+  ## Returns
+
+    * `:ok` on success
+    * `{:error, :no_change_required}` if already at target count
+    * `{:error, :processor_not_found}` if processor_key doesn't exist
+    * `{:error, :partition_dispatcher_requires_pipeline_restart}` for pipelines with `partition_by`
+    * `{:error, {:failed_to_add_processor, index, reason}}` if scaling up fails
+    * `{:error, {:failed_to_remove_processor, index, reason}}` if scaling down fails
+
+  ## Telemetry Events
+
+  The following telemetry events are emitted during scaling:
+
+    * `[:broadway, :scale, :start]` - Emitted when scaling starts
+      * Measurements: `%{system_time: integer()}`
+      * Metadata: `%{broadway: atom(), processor_key: atom(), from_count: integer(), to_count: integer()}`
+
+    * `[:broadway, :scale, :stop]` - Emitted when scaling completes
+      * Measurements: `%{system_time: integer(), duration: integer()}`
+      * Metadata: `%{broadway: atom(), processor_key: atom(), from_count: integer(), to_count: integer(), strategy: atom(), result: term()}`
+
+  ## Examples
+
+      # Scale up to 8 processors
+      Broadway.scale_processors(MyBroadway, :default, 8)
+
+      # Scale down with graceful draining (30 second timeout)
+      Broadway.scale_processors(MyBroadway, :default, 2, drain_timeout: 30_000)
+
+      # Scale down immediately without waiting for drain
+      Broadway.scale_processors(MyBroadway, :default, 2, strategy: :immediate)
+
+      # Get current processor count before scaling
+      {:ok, current} = Broadway.get_processor_count(MyBroadway)
+      Broadway.scale_processors(MyBroadway, :default, current * 2)
+
+  """
+  @doc since: "1.2.0"
+  @spec scale_processors(name(), atom(), pos_integer(), keyword()) ::
+          :ok | {:error, term()}
+  def scale_processors(broadway, processor_key \\ :default, new_count, opts \\ [])
+      when is_broadway_name(broadway) and is_atom(processor_key) and
+             is_integer(new_count) and new_count > 0 and is_list(opts) do
+    Topology.scale_processors(broadway, processor_key, new_count, opts)
+  end
+
+  @doc """
+  Returns the current processor count for the given processor key.
+
+  ## Arguments
+
+    * `broadway` - The Broadway server name or PID
+    * `processor_key` - The processor key (defaults to `:default`)
+
+  ## Returns
+
+    * `{:ok, count}` where count is the current number of processor workers
+    * `{:error, :processor_not_found}` if the processor_key doesn't exist
+
+  ## Examples
+
+      {:ok, count} = Broadway.get_processor_count(MyBroadway)
+      # => {:ok, 4}
+
+      {:ok, count} = Broadway.get_processor_count(MyBroadway, :default)
+      # => {:ok, 4}
+
+  """
+  @doc since: "1.2.0"
+  @spec get_processor_count(name(), atom()) :: {:ok, pos_integer()} | {:error, term()}
+  def get_processor_count(broadway, processor_key \\ :default)
+      when is_broadway_name(broadway) and is_atom(processor_key) do
+    Topology.get_processor_count(broadway, processor_key)
+  end
+
+  @doc """
   Returns all running Broadway names.
 
   It's important to notice that no order is guaranteed.

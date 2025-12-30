@@ -21,6 +21,17 @@ defmodule Broadway.Topology.Subscriber do
     )
   end
 
+  @doc """
+  Dynamically subscribes to a new producer.
+
+  This is used during runtime scaling to have batchers subscribe to
+  newly added processors.
+  """
+  @spec subscribe_to(GenServer.server(), atom()) :: :ok
+  def subscribe_to(subscriber, process_name) when is_atom(process_name) do
+    GenStage.async_info(subscriber, {:subscribe_to, process_name})
+  end
+
   @impl true
   def init({module, names, options, subscription_options}) do
     {type, state, init_options} = module.init(options)
@@ -111,6 +122,11 @@ defmodule Broadway.Topology.Subscriber do
   end
 
   def handle_info({:resubscribe, process_name}, state) do
+    subscribe(process_name, state)
+    {:noreply, [], state}
+  end
+
+  def handle_info({:subscribe_to, process_name}, state) do
     subscribe(process_name, state)
     {:noreply, [], state}
   end
